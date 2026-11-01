@@ -251,7 +251,7 @@
                         {% csrf_token %}
                         <input type="hidden" name="problem_id" value="{{ problem_id }}">
                         <input type="hidden" name="migrate_to_azure" value="1">
-                        <button class="btn btn-success {% if not db_problem %}disabled{% endif %}" type="submit" {% if not db_problem %}disabled data-bs-toggle="tooltip" data-bs-placement="top" title="Please migrate the problem to the database first."{% endif %}>Migrate Test Cases to Azure</button>
+                        <button class="btn btn-success {% if not db_problem %}disabled{% endif %}" type="submit" {% if not db_problem %}disabled data-bs-toggle="tooltip" data-bs-placement="top" title="Please migrate the problem to the database first."{% endif %}>Migrate Test Cases to Cloud Storage</button>
                     </form>
                 </div>
                 
@@ -429,7 +429,7 @@
         var azureForm = document.getElementById('migrate-azure-form');
         if (azureForm) {
             azureForm.addEventListener('submit', function() {
-                showLoading('Migrating to Azure...');
+                showLoading('Migrating to cloud storage...');
             });
         }
         
