@@ -1,0 +1,7 @@
+PolygonMigration/.env
+.env
+.venv/
+__pycache__/
+*.pyc
+*.log
+PolygonMigration/.env
