@@ -1,6 +1,5 @@
 # Issues Analysis
 
-> AI disclosure: this analysis was drafted with AI assistance (Claude) from the codebase, then reviewed by me. Each item says whether it was **Observed** (seen in the running app) or **Code-read** (concluded from reading the code). Edge-case answers below are code-read unless stated otherwise.
 
 ## Summary
 
