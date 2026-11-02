@@ -149,21 +149,94 @@ Routes (`users/urls.py`): `/users/login/` (name `login`) and `/users/logout/` (n
    7. Sets the success message, then the view continues with the display steps from flow 2.
 4. **External APIs.** Polygon: `problem.tests`, `problem.testInput`, `problem.testAnswer` (if not cached), `problem.checker`, `problem.viewFile` (custom checker). Cloud: Supabase Storage through its S3-compatible API (`put_object`, `delete_object`, `list_objects_v2` via `S3StorageManager`). With `STORAGE_PROVIDER=azure` the same calls go to Azure Blob Storage instead.
 5. **Reads and writes.**
-   - Cloud storage layout (Supabase bucket named by `AWS_S3_BUCKET_NAME`, as verified in `tests.py`): `test_cases/<db_id>/<NN>` for input and `test_cases/<db_id>/<NN>.a` for output, with `NN` zero-padded to two digits; plus `test_cases/<db_id>/custom_checker` (`.exe` on Windows) or `custom_checker.cpp`. The Azure backend (`AzureTestcase.py`) implements the same interface but is not used in this deployment.
+   - Cloud storage layout (Supabase bucket named by `AWS_S3_BUCKET_NAME`, as verified in `tests.py`): `test_cases/<db_id>/<NN>` for input and `test_cases/<db_id>/<NN>.a` for output, with `NN` zero-padded to two digits; plus `test_cases/<db_id>/custom_checker` or `custom_checker.cpp`. The Azure backend (`AzureTestcase.py`) implements the same interface but is not used in this deployment.
    - Redis: deletes the main platform's test-case keys; reads or refills `polygon_migration_test_cases_<polygon_id>_*`.
    - DB: read-only here.
 6. **What the user sees.** A green box: "Test cases migrated to cloud storage (<provider>) successfully." (plus a note if a custom checker was compiled and uploaded). On failure, a red error with the reason.
 
 ---
 
-## 7. Error handling and rollback (applies to flows 3 to 5)
+## 7. External integrations
+
+### 7.1 Polygon API
+
+**Base URL:** `https://polygon.codeforces.com/api/<method>` (`PolygonAPI.API_URL` in `problems/polygon_api.py`).
+**HTTP:** every call is a `POST` with form-encoded parameters (`requests.post(url, data=...)`), made by `PolygonAPI._make_request` (JSON replies) or `_make_plain_request` (plain-text replies). The package download in `download_and_extract_package` posts directly to get binary data.
+
+**Endpoints used**
+
+| Polygon method | Parameters sent | Reply type | Used by (function) | Purpose |
+|---|---|---|---|---|
+| `problem.info` | `problemId` | JSON | `get_problem_info` | Problem name, time limit, memory limit |
+| `problem.packages` | `problemId` | JSON | `download_and_extract_package` | List built packages; the code picks the `standard` package with the highest `revision` |
+| `problem.package` | `problemId`, `packageId`, `type=standard` | Binary ZIP | `download_and_extract_package` | Download the package; `problem.html` is read from it and parsed by `parse_problem_html` (statement, input/output format, notes) |
+| `problem.tests` | `problemId`, `testset=tests` | JSON | `get_all_test_cases`, `get_test_cases` | List of tests (`index`, `manual`, `useInStatements`, `description`); also used to count tests |
+| `problem.testInput` | `problemId`, `testset`, `testIndex` | Plain text | `get_all_test_cases` | Input of one test (called once per test) |
+| `problem.testAnswer` | `problemId`, `testset`, `testIndex` | Plain text | `get_all_test_cases` | Expected output of one test (called once per test) |
+| `problem.checker` | `problemId` | JSON | `index()`, `get_custom_checker_info` | Checker name; `std::ncmp.cpp`-style names are normalized, anything not in the list of standard checkers becomes `custom` |
+| `problem.viewFile` | `problemId`, `type` (`source`, then `resource`), `name` | Plain text | `fetch_custom_checker_file` | Source of a custom checker (retries with a `.cpp` suffix) |
+| `problem.updateWorkingCopy` | `problemId` | JSON | `index()` | Refreshes the working copy before reading solutions (only when the problem is already in the DB) |
+| `problem.solutions` | `problemId` | JSON | `index()` | List solutions; picks the main one (tag `MA`) or the first |
+| `problem.viewSolution` | `problemId`, `name` | Plain text | `index()` | Source code shown in "Main Correct Solution" |
+
+`PolygonAPI` also defines helpers for `problem.statements`, `problem.script`, `problem.files`, and `problem.viewFile` (`get_statements`, `get_test_script`, `get_problem_files`, `get_file_content`), but the current flows do not call them.
+
+**Authentication** (`PolygonAPI._generate_api_sig`)
+
+Credentials are read from Django settings (`POLYGON_API_KEY`, `POLYGON_API_SECRET`, loaded from `.env`) in `PolygonAPI.__init__`. Each request is signed like this:
+
+1. Add `apiKey` and `time` (current Unix time, in seconds) to the request parameters.
+2. Sort all parameters alphabetically by name and URL-encode them into a string (`urlencode`).
+3. Generate a random 6-character prefix `rand` (lowercase letters and digits).
+4. Build the string `rand/<method>?<sorted params>#<API_SECRET>` and take its SHA-512 hex digest.
+5. `apiSig = rand + digest`.
+6. Send the original parameters plus `apiKey`, `time`, and `apiSig` in the POST body.
+
+The secret is only used to compute the hash; it is never sent over the wire. A new `time` and `rand` are generated for every call, so each signature is unique.
+
+**Error handling:** an HTTP error raises `HTTP Request Error: ...`. For JSON replies, a body with `status == "FAILED"` raises `Polygon API Error: <comment>`, otherwise `result` is returned. A package download that does not start with the ZIP signature (`PK`) is treated as an error. Failures in the fetch/migrate flows reach the user as the red error box and trigger the rollback described in section 8.
+
+**Performance note:** `get_all_test_cases` makes `1 + 2 * N` Polygon calls for N tests, which is why results are cached in Redis for 30 minutes and reused by the migration steps.
+
+### 7.2 Cloud storage (Supabase Storage via the S3-compatible API)
+
+**Provider and access** (`problems/storage.py`, `problems/S3Testcase.py::S3StorageManager`): `STORAGE_PROVIDER=s3` makes `get_storage()` return `S3StorageManager`, a boto3 S3 client pointed at the Supabase S3 endpoint (`S3_ENDPOINT_URL`, region `AWS_REGION`). It authenticates with the S3 access key pair from `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`); missing credentials raise a `ValueError`. The bucket name comes from `AWS_S3_BUCKET_NAME` (`get_container_name()`). The code depends only on a small interface (`upload_test_case`, `upload_file`, `empty_blob`), so Azure (`AzureTestcase.py`) can be swapped in with `STORAGE_PROVIDER=azure`; it is not used here.
+
+**File naming and organization**
+
+All files for one problem live under one prefix, named with the **database problem ID** (`Problem.id`), not the Polygon ID:
+
+```
+<bucket>/
+  test_cases/
+    <db_problem_id>/
+      01            <- input of test 1
+      01.a          <- expected output (answer) of test 1
+      02
+      02.a
+      ...
+      custom_checker       <- compiled checker binary (built with g++ on the Linux server)
+      custom_checker.cpp   <- checker source, uploaded only if compilation fails
+```
+
+Rules:
+
+- Test number = the test's position in the list from Polygon, starting at 1, zero-padded to two digits (`01`, `02`, ... `12`). The output file adds the `.a` suffix.
+- Only tests with both a non-empty input and a non-empty output are uploaded. Skipped tests leave a gap in the numbering, because the number is the position in the list.
+- The custom checker is uploaded only for problems whose checker is not a standard one. It is compiled with `g++ -std=gnu++17 -O2` and the binary is uploaded; if compilation fails, the `.cpp` source is uploaded instead.
+- Re-running the migration is safe: `empty_blob(bucket, db_id)` first deletes every object under `test_cases/<db_id>/` (the trailing slash in the prefix keeps `test_cases/7/` from matching `test_cases/70/`), and then the files are uploaded again.
+- File contents are the raw text from Polygon, uploaded as bytes (`put_object`).
+
+---
+
+## 8. Error handling and rollback (applies to flows 3 to 5)
 
 - Each POST runs inside `transaction.atomic()`, so any exception rolls back all database changes from that request.
 - Cloud storage is not transactional. If the upload itself fails, `delete_problem_files(db_id)` removes partial uploads. If a later step in the same request fails, the outer `except` removes the files uploaded earlier (`storage_uploaded` and `storage_problem_id`).
 - The outer `except` also calls `clear_test_cases_from_redis(polygon_id)` so a bad cache is not reused.
 - The user sees: "Migration failed and all changes have been rolled back. Reason: ...".
 
-## 8. Running the tests
+## 9. Running the tests
 
 ```
 python manage.py test problems
