@@ -4,9 +4,11 @@ from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError
 import logging
 
+from .storage import StorageBackend
+
 logger = logging.getLogger(__name__)
 
-class AzureBlobManager:
+class AzureBlobManager(StorageBackend):
     """
     A manager class to handle read/write operations for Azure Blob Storage using user credentials.
 
@@ -51,6 +53,23 @@ class AzureBlobManager:
         except Exception as e:
             logger.error(f"An unexpected error occurred during initialization: {e}")
             raise
+
+    def upload_file(self, container_name, blob_name, data):
+        """
+        Uploads raw bytes to an exact blob name, replacing any existing blob.
+
+        Args:
+            container_name (str): The name of the container.
+            blob_name (str): The full blob name (e.g. test_cases/12/custom_checker).
+            data (bytes|str): The content to store.
+
+        Returns:
+            None
+        """
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        blob_client = self.blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        blob_client.upload_blob(data, overwrite=True)
 
     def upload_test_case(self, container_name, db_problem_id, test_number, input_data, output_data):
         """
