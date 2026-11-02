@@ -1,245 +1,142 @@
-# Functionality Documentation: Polygon Problem Migrator ("Hatsu")
+# Hatsu Problem Migrator: Functionality Documentation
 
-A Django tool that lets a staff user pull a problem from [Polygon](https://polygon.codeforces.com), store the problem in the database, and upload its test cases to cloud storage. This deployment uses **Supabase Storage**, accessed through its S3-compatible API (`STORAGE_PROVIDER=s3`). Azure Blob Storage is supported by the code as an alternative provider but is not used.
+This document lets a new engineer follow a user action from the browser, through the backend, to the database or an external service. It describes the code as it is, using real file, function and URL names.
 
-## 1. Architecture at a glance
+## 1. Overview
 
-| Layer | File | Role |
+The app is a staff-only Django web application. A staff member enters a Polygon problem ID. The app fetches the problem and its test cases from Polygon, then copies them into the app's PostgreSQL database and uploads the full test-case files to cloud storage.
+
+| Part | Technology | Role |
 |---|---|---|
-| Template (browser) | `problems/templates/problems/index.html` | One page with several small forms and a tag picker (vanilla JS, Bootstrap) |
-| View | `problems/views.py` → `index()` | The only endpoint. Every button on the page POSTs here; a hidden field decides what runs |
-| Polygon client | `problems/polygon_api.py` → `PolygonAPI` | Signs and sends Polygon requests, downloads the package, caches test cases in Redis, drives the cloud upload |
-| Storage layer | `problems/storage.py` (`get_storage`, `get_container_name`, `get_provider_name`), `S3Testcase.py` (`S3StorageManager`), `AzureTestcase.py` | Provider-independent upload interface. `STORAGE_PROVIDER` selects S3 or Azure |
-| Models | `problems/models.py` | `Problem`, `SampleTestCase`, `ProblemTestCase`, `ProblemTag` |
-| URL | `problems/urls.py` | `app_name = 'problems'`, `path('', views.index, name='index')` |
-| Auth | `users/views.py`, `users/backends.py`, `users/models.py`, `users/urls.py` | Email + password login, staff-only access, custom `User` model |
-| Tests | `problems/tests.py` | S3 layout, provider switch, and migration-flow tests |
+| Web app | Django 5.2.3 | Pages, forms, login, admin |
+| Database | PostgreSQL | Users, sessions, problems, tags, test cases |
+| Cache | Redis | Holds the fetched test cases for 30 minutes so Polygon is not called again |
+| External API | Polygon (`https://polygon.codeforces.com/api/`) | Source of the problem, statement, tests and checker |
+| File storage | Azure Blob Storage or any S3-compatible service (Supabase, AWS S3, R2, MinIO) | Full input and answer file of every test case |
 
-**Single endpoint, multiple actions.** `index()` is the only view. The form that was submitted is identified by which hidden field is present in `request.POST`:
+### 1.1 Repository layout
 
-| Hidden field | Button on the page | Action |
+```
+PolygonMigration/                  Django project root (manage.py lives here)
+  PolygonMigration/                settings.py, urls.py, wsgi.py, asgi.py
+  problems/                        the migrator
+    views.py                       index view: handles every button on the main page
+    polygon_api.py                 PolygonAPI class: Polygon calls, Redis cache, storage migration
+    models.py                      Problem, ProblemTag, SampleTestCase, ProblemTestCase
+    storage.py                     storage interface and provider switch (get_storage)
+    S3Testcase.py                  S3-compatible storage class (boto3)
+    AzureTestcase.py               Azure Blob storage class
+    templates/problems/index.html  the page the user sees
+  users/                           login and the custom user model
+    views.py                       login_view, logout_view
+    backends.py                    EmailBackend (log in with email)
+    models.py                      custom User (email is the login name)
+    templates/users/login.html     the login page
+  contents/                        owns the Topic model that User refers to
+```
+
+### 1.2 URL map
+
+`PolygonMigration/PolygonMigration/urls.py` routes requests like this:
+
+| URL | Goes to | Notes |
 |---|---|---|
-| *(none, only `problem_id`)* | Fetch Problem | Fetch and display only |
-| `migrate_to_db=1` | Create/Update problem in Database | Save problem, tags, sample tests |
-| `migrate_test_cases_to_db=1` | Migrate Test Description to Database | Save all test cases (truncated) |
-| `migrate_to_azure=1` | Migrate Test Cases to Cloud Storage | Upload to the configured provider (the field name is historical; it is not Azure-only) |
+| `/` | `problems.urls`, view `problems.views.index` | The migrator page. Staff only |
+| `/users/login/` | `users.views.login_view` | URL name `login` |
+| `/users/logout/` | `users.views.logout_view` | URL name `logout` |
+| `/admin/` | Django admin | Separate login, same users |
 
-**External services:** Polygon API, Redis (test-case cache), Supabase Storage (via the S3-compatible endpoint, `S3_ENDPOINT_URL` of the form `https://<project>.supabase.co/storage/v1/s3`), the relational database (Django ORM). Azure Blob Storage is an optional alternative (`STORAGE_PROVIDER=azure`).
+### 1.3 Configuration
 
-**Configuration (Django settings / `.env`):** `POLYGON_API_KEY`, `POLYGON_API_SECRET`, `STORAGE_PROVIDER` (`s3` or `azure`), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_ENDPOINT_URL`, `AWS_S3_BUCKET_NAME`, `AZURE_CONTAINER_NAME`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_SSL`, `CUSTOM_CHECKER_DIR`.
+All secrets and endpoints come from the `.env` file, which `settings.py` reads with `os.getenv`. See `.env.example` for the full list (database, Redis, Polygon key and secret, storage provider).
 
-**How the code is organized in `index()`:** after the access check, each POST runs inside one `transaction.atomic()` block, so a failure rolls back every database change from that request. Cloud uploads and Redis are not transactional, so the `except` block undoes them by hand (see section 7).
+## 2. Functionality
+
+### 2.1 User flows
 
 ---
 
-## 2. Flow 1: User login
+### Flow 1: User login
 
-**Code:** `users/urls.py` (routes), `users/views.py::login_view` and `logout_view`, `users/backends.py::EmailBackend`, `users/models.py::User`, `users/templates/users/login.html`; the access gate on the migrator page is the decorator on `index()` in `problems/views.py`:
+**Files:** `users/views.py` (`login_view`, `logout_view`), `users/backends.py` (`EmailBackend`), `users/models.py` (`User`, `UserManager`), `users/templates/users/login.html`, `problems/views.py` (the `@user_passes_test` decorator on `index`), `settings.py` (`AUTH_USER_MODEL`, `AUTHENTICATION_BACKENDS`, `SESSION_COOKIE_AGE`, middleware).
+
+#### 1. What the user clicks or submits
+
+The user opens `http://localhost:8000/`. They are not logged in, so Django sends them to the **Staff Login** page. They type their email and password and click **Login**.
+
+The redirect happens because `index` in `problems/views.py` is wrapped in:
 
 ```python
 @user_passes_test(lambda u: u.is_authenticated and u.is_staff, login_url='/users/login/')
-def index(request): ...
 ```
 
-Routes (`users/urls.py`): `/users/login/` (name `login`) and `/users/logout/` (name `logout`).
+An anonymous request to `/` gets a `302` to `/users/login/?next=/`.
 
-1. **What the user clicks or submits.** An anonymous (or non-staff) user who opens the migrator page is redirected to `/users/login/`. They enter their email and password on the login form and submit it. If they are already logged in, the navbar on the migrator page shows "Welcome, {first_name} {last_name}" and a **Logout** button.
-2. **What the frontend sends.** Login: `POST /users/login/` with `email` and `password` (the two fields `login_view` reads from `request.POST`). Logout: the navbar form sends `POST /users/logout/` with the CSRF token.
-3. **What the backend does, in order.**
-   1. `login_view` first checks `request.user.is_authenticated`; if the visitor already has a session, it calls `logout(request)` so the login page always starts clean.
-   2. On `POST`, it reads `email` and `password` and calls `authenticate(request, username=email, email=email, password=password)`.
-   3. `authenticate` runs `EmailBackend.authenticate` (a `ModelBackend` subclass in `users/backends.py`). It takes the email from `kwargs['email']` (falling back to `username`), loads the user with `User.objects.get(email=email)`, and returns the user only if `check_password(password)` is true and `user_can_authenticate(user)` is true (the user must have `is_active=True`). Otherwise it returns `None`.
-   4. If `authenticate` returns a user and `user.is_staff` is true, `login(request, user)` creates the session and the view redirects to `problems:index` (the migrator page).
-   5. If the user exists but is not staff, no session is created and the message "You do not have staff access." is queued. If authentication fails, the message "Invalid email or password." is queued. In both cases `users/login.html` is rendered again.
-   6. Logout: `logout_view` calls `logout(request)` (destroys the session) and redirects to the URL named `login`.
-   7. On every later visit to the migrator page, `user_passes_test` re-checks `is_authenticated and is_staff`; if the check fails, the request is redirected to `/users/login/` and `index()` does not run.
-4. **External APIs.** None. Authentication is entirely local: no Polygon, cloud, or third-party login provider is involved.
-5. **Reads and writes.**
-   - DB read: the `User` table (`users.User`, a custom model with `USERNAME_FIELD = 'email'`) to look up the user by email and verify the password hash.
-   - Session: `login()` writes a session (Django's session framework); `logout()` clears it.
-   - Nothing is written to the problem tables or to cloud storage in this flow. Staff accounts are created with `UserManager.create_superuser` or by setting `is_staff=True` on a user.
-6. **What the user sees.** On success, they land on "Hatsu: Problem Migrator" with their name in the navbar. On failure, they stay on the login page with an error message ("Invalid email or password." or "You do not have staff access."). After logout, they are returned to the login page.
+#### 2. What the frontend sends
 
----
+The login form in `login.html` is a plain HTML `<form method="post">`. It has no JavaScript. It sends one `POST /users/login/` with these fields:
 
-## 3. Flow 2: Fetching a problem from Polygon
+| Field | Source |
+|---|---|
+| `email` | the Email input (`type="email"`) |
+| `password` | the Password input |
+| `csrfmiddlewaretoken` | the `{% csrf_token %}` tag, checked by `CsrfViewMiddleware` |
 
-**Code:** `problems/views.py::index`, `parse_problem_html`; `problems/polygon_api.py::PolygonAPI`.
+#### 3. What the backend does, in order
 
-1. **What the user clicks or submits.** The user types a Polygon problem ID and clicks **Fetch Problem** (`#fetchForm`). JavaScript intercepts the submit, shows the loading overlay ("Fetching problem data and test cases (may take 3-4 minutes)..."), then submits the form.
-2. **What the frontend sends.** `POST` to the same page with `csrfmiddlewaretoken` and `problem_id`. No `migrate_*` field is present.
-3. **What the backend does, in order.**
-   1. `index()` builds the tag list for the dropdown (`ProblemTag`, serialized as `all_tags_json`).
-   2. It creates `PolygonAPI()` and looks up `Problem.objects.filter(polygon_id=...)`. If the problem is already in the database, it pre-fills `difficulty` and selected tags from the DB and fetches the main solution (see step 4).
-   3. Inside `transaction.atomic()`: `api.get_problem_info()` gets name, time limit, memory limit.
-   4. `api.download_and_extract_package()` lists packages, picks the highest-revision `standard` package, downloads the ZIP, extracts it in a temp directory, reads `problem.html`, and deletes the temp directory.
-   5. `parse_problem_html()` (lxml) extracts title, legend (statement), input format, output format, and notes.
-   6. Test cases: with no migrate flag, `api.get_all_test_cases()` is called and the result is cached with `store_test_cases_in_redis(..., expiry_hours=0.5)`.
-   7. It computes the slug (`slugify(title)`), reads the checker (`problem.checker`) and normalizes it (`std::ncmp.cpp` becomes `ncmp`, unknown names become `custom`), checks for a custom checker (`get_custom_checker_info`), and counts tests (`get_test_cases`).
-   8. All this is placed in `context['fetched_problem']` and `context['all_test_cases']` (previews truncated to 50 chars) for the template. Nothing is written to the database in this flow.
-4. **External APIs called (Polygon, `POST https://polygon.codeforces.com/api/<method>`).**
-   `problem.info`, `problem.packages`, `problem.package`, `problem.tests`, `problem.testInput` and `problem.testAnswer` (once per test), `problem.checker`. If the problem is already in the DB: `problem.updateWorkingCopy`, `problem.solutions`, `problem.viewSolution`.
-   Each request is signed in `PolygonAPI._generate_api_sig`: parameters plus `apiKey` and `time` are sorted, a 6-character random prefix is added, and `apiSig = prefix + sha512(prefix/method?params#secret)`.
-5. **Reads and writes.**
-   - DB: reads `Problem`, `ProblemTag`.
-   - Redis: writes `polygon_migration_test_cases_<polygon_id>_count` and `..._test_<n>` (JSON per test: `index`, `input`, `output`, `description`, `is_sample`), 30-minute TTL.
-   - No cloud storage writes.
-6. **What the user sees.** A "Fetched Problem" section: slug, difficulty selector, tag picker, time/memory limit, checker type, test count, the statement/input/output/notes HTML, and a table of all test cases with truncated previews and a "View Full" modal. If the problem is not in the DB yet, the DB ID and Algopath link say "Please migrate to database first" and the cloud/test-case buttons are disabled. On a Polygon error, a red error box shows the message.
+`login_view` in `users/views.py`:
 
----
+1. If the visitor already has a logged-in session, it calls `logout(request)` first. Opening the login page while logged in logs you out.
+2. If the request is a `GET`, it renders `users/login.html` and stops.
+3. On `POST`, it reads `email` and `password` from `request.POST`.
+4. It calls `authenticate(request, username=email, email=email, password=password)`. Django tries each class in `AUTHENTICATION_BACKENDS` in order:
+   - `users.backends.EmailBackend.authenticate` looks up one user with `User.objects.get(email=email)`, checks `user.check_password(password)`, and checks `user_can_authenticate` (the account must have `is_active=True`). It returns the user, or `None`.
+   - Django's `ModelBackend` is the fallback. The `User` model sets `USERNAME_FIELD = 'email'`, so it also accepts the email as the username.
+5. If `authenticate` returns `None`, it adds the message `Invalid email or password.` and re-renders the login page.
+6. If a user is found but `user.is_staff` is false, it adds `You do not have staff access.` and re-renders the page.
+7. If the user is staff, it calls `login(request, user)`, which creates the session and sets the `sessionid` cookie, then returns `redirect('problems:index')`.
 
-## 4. Flow 3: Migrating a problem to the database
+The request then goes to `/`, where the `@user_passes_test` check passes because `is_authenticated` and `is_staff` are both true.
 
-**Code:** `index()` in `problems/views.py` (branch `if migrate_to_db:`), models in `problems/models.py`.
+#### 4. External APIs
 
-1. **What the user clicks or submits.** After fetching, the user selects a **Difficulty** (required), optionally picks or adds tags, and clicks **Create/Update problem in Database** (`#migrate-db-form`). The form's JS blocks submit with an alert if no difficulty is selected, copies the selected tags into hidden inputs (`updateHiddenInputs`), and shows a spinner.
-2. **What the frontend sends.** `POST` with `problem_id`, `migrate_to_db=1`, `difficulty` (`easy`/`medium`/`hard`), and one `tags` value per selected tag.
-3. **What the backend does, in order.**
-   1. Re-runs the fetch steps from flow 2 (info, package, parse HTML, checker, test count). Test cases come from Redis if cached, otherwise from Polygon.
-   2. Validates that `difficulty` is present. If not, it raises and the transaction is rolled back.
-   3. `Problem.objects.filter(polygon_id=...)`: if found, it updates title, slug, difficulty, statement, input/output format, time and memory limit, checker type, test count, notes, and saves. If not found, `Problem.objects.create(...)`.
-   4. Tags: `extra_tags.clear()`, then for each submitted tag `ProblemTag.objects.get_or_create(tag_name=...)` and `extra_tags.add(tag)`. New tags typed in the picker are created here.
-   5. Sample tests: filters test cases with `is_sample=True`; for each with non-empty input and output, it updates the existing `SampleTestCase` at that position or creates a new one, with `order` starting at 1.
-   6. Re-reads the problem from the DB and fetches the main solution (tag `MA`, or the first solution) for display.
-4. **External APIs.** Same Polygon calls as flow 2, plus `problem.solutions` and `problem.viewSolution`. No cloud calls.
-5. **Reads and writes.**
-   - DB writes: `Problem` (create/update), `ProblemTag` (get_or_create), `Problem.extra_tags` (M2M), `SampleTestCase` (create/update).
-   - Redis: reads cached test cases (or refills the cache on a miss).
-6. **What the user sees.** A blue "Database Operation" box: "Problem '<title>' created/updated in database successfully." (plus a custom-checker note if there is one). The page now shows the database problem ID and the link `https://www.algopath.ai/problems/<slug>`, and the main solution with a Copy button. On failure: "Migration failed and all changes have been rolled back. Reason: ...".
+None. Login only touches the app's own database.
 
----
+#### 5. What is read or written
 
-## 5. Flow 4: Migrating test cases to the database
+| Table | Operation |
+|---|---|
+| `users_user` | Read: one row by `email`. Written: `last_login` is updated by Django's `login()` |
+| `django_session` | Written: one new session row. Sessions live in the database because `settings.py` does not override `SESSION_ENGINE` |
 
-**Code:** `index()` in `problems/views.py` (branch `if migrate_test_cases_to_db:`), models `ProblemTestCase`.
+The session lasts one day (`SESSION_COOKIE_AGE = 86400`). Passwords are stored as hashes. `check_password` compares against the hash, and password validators (`AUTH_PASSWORD_VALIDATORS`) only run when a password is created, for example by `createsuperuser`.
 
-1. **What the user clicks or submits.** Under the test case table, the user clicks **Migrate Test Description to Database** (`#migrate-test-cases-form`). The button is disabled until the problem exists in the DB.
-2. **What the frontend sends.** `POST` with `problem_id` and `migrate_test_cases_to_db=1`.
-3. **What the backend does, in order.**
-   1. Re-runs the fetch/display steps (flow 2).
-   2. Looks up the `Problem` by `polygon_id`. If missing, it raises "Please migrate the problem to the database first."
-   3. Gets the test cases from Redis (`get_test_cases_from_redis`), falling back to `get_all_test_cases` and re-caching.
-   4. Loads the existing `ProblemTestCase` rows for the problem. For each Polygon test with non-empty input and output, it truncates input and output to 260 characters, then updates the row at the same position or creates a new `ProblemTestCase` (`is_sample`, `input`, `output`, `description`, `order`).
-4. **External APIs.** Polygon only if the Redis cache is empty or expired (`problem.tests`, `problem.testInput`, `problem.testAnswer`).
-5. **Reads and writes.**
-   - DB: reads `Problem` and `ProblemTestCase`; writes `ProblemTestCase` rows.
-   - Redis: read, or refill on a miss.
-   - Only the first 260 characters of each test are stored in the DB; the full data goes to cloud storage (flow 5).
-6. **What the user sees.** A green box: "Test cases description migrated to database Successfully." On failure, a rollback error message.
+#### 6. What the user sees
 
----
+- **On success:** the browser lands on `/`, the page titled **Hatsu: Problem Migrator**, with the navbar text `Welcome, <first name> <last name>` and a **Logout** button.
+- **On failure:** the login page again with a red alert box. The text is either `Invalid email or password.` or `You do not have staff access.` Every message is shown with the `alert-danger` style.
 
-## 6. Flow 5: Uploading test cases to cloud storage
+**Logging out:** the navbar in `problems/templates/problems/index.html` has a small form (`method="post"`, `action="/users/logout/"`, with a CSRF token) whose **Logout** button submits it. `logout_view` calls `logout(request)`, which deletes the session, and redirects to the `login` URL. For an anonymous visitor the same navbar shows a **Login** link to `/users/login/` instead.
 
-**Code:** `index()` (branch `if migrate_to_azure:`), `PolygonAPI.migrate_to_cloud_storage`, `upload_custom_checker`, `_compile_and_upload_checker`, `delete_problem_files`, `delete_problem_test_case_cache`; storage in `problems/storage.py`, `S3Testcase.py`, `AzureTestcase.py`.
-
-1. **What the user clicks or submits.** The user clicks **Migrate Test Cases to Cloud Storage** (`#migrate-azure-form`; disabled until the problem is in the DB). A spinner shows "Migrating to cloud storage...".
-2. **What the frontend sends.** `POST` with `problem_id` and `migrate_to_azure=1`.
-3. **What the backend does, in order.**
-   1. Looks up the `Problem`. If it is not in the DB, it returns an error telling the user to migrate the problem first.
-   2. Reads the provider and container: `get_provider_name()` and `get_container_name()` (`STORAGE_PROVIDER`, `AWS_S3_BUCKET_NAME` or `AZURE_CONTAINER_NAME`).
-   3. Uses the database ID (`problem_obj.id`) for naming, not the Polygon ID.
-   4. `delete_problem_test_case_cache(db_id)` deletes the main platform's Redis keys matching `oj_dev_with_redis_storage_test_cases_<db_id>*` so no stale tests stay cached.
-   5. `get_custom_checker_info()` detects a non-standard checker and sets an info message.
-   6. `migrate_to_cloud_storage()`:
-      - gets the test cases from Redis, or from Polygon on a miss;
-      - `storage.empty_blob(container, db_id)` deletes the old files for the problem;
-      - for each test with both input and output, `storage.upload_test_case(container, db_id, idx, input, output)` (incomplete tests are skipped with a warning);
-      - `upload_custom_checker()` fetches the checker source (`problem.viewFile`, trying `source`, then `resource`, then with `.cpp`), compiles it with `g++ -std=gnu++17 -O2` in `CUSTOM_CHECKER_DIR` (or a temp dir), and uploads the binary. If compilation fails it uploads the source as `custom_checker.cpp` instead.
-   7. Sets the success message, then the view continues with the display steps from flow 2.
-4. **External APIs.** Polygon: `problem.tests`, `problem.testInput`, `problem.testAnswer` (if not cached), `problem.checker`, `problem.viewFile` (custom checker). Cloud: Supabase Storage through its S3-compatible API (`put_object`, `delete_object`, `list_objects_v2` via `S3StorageManager`). With `STORAGE_PROVIDER=azure` the same calls go to Azure Blob Storage instead.
-5. **Reads and writes.**
-   - Cloud storage layout (Supabase bucket named by `AWS_S3_BUCKET_NAME`, as verified in `tests.py`): `test_cases/<db_id>/<NN>` for input and `test_cases/<db_id>/<NN>.a` for output, with `NN` zero-padded to two digits; plus `test_cases/<db_id>/custom_checker` or `custom_checker.cpp`. The Azure backend (`AzureTestcase.py`) implements the same interface but is not used in this deployment.
-   - Redis: deletes the main platform's test-case keys; reads or refills `polygon_migration_test_cases_<polygon_id>_*`.
-   - DB: read-only here.
-6. **What the user sees.** A green box: "Test cases migrated to cloud storage (<provider>) successfully." (plus a note if a custom checker was compiled and uploaded). On failure, a red error with the reason.
-
----
-
-## 7. External integrations
-
-### 7.1 Polygon API
-
-**Base URL:** `https://polygon.codeforces.com/api/<method>` (`PolygonAPI.API_URL` in `problems/polygon_api.py`).
-**HTTP:** every call is a `POST` with form-encoded parameters (`requests.post(url, data=...)`), made by `PolygonAPI._make_request` (JSON replies) or `_make_plain_request` (plain-text replies). The package download in `download_and_extract_package` posts directly to get binary data.
-
-**Endpoints used**
-
-| Polygon method | Parameters sent | Reply type | Used by (function) | Purpose |
-|---|---|---|---|---|
-| `problem.info` | `problemId` | JSON | `get_problem_info` | Problem name, time limit, memory limit |
-| `problem.packages` | `problemId` | JSON | `download_and_extract_package` | List built packages; the code picks the `standard` package with the highest `revision` |
-| `problem.package` | `problemId`, `packageId`, `type=standard` | Binary ZIP | `download_and_extract_package` | Download the package; `problem.html` is read from it and parsed by `parse_problem_html` (statement, input/output format, notes) |
-| `problem.tests` | `problemId`, `testset=tests` | JSON | `get_all_test_cases`, `get_test_cases` | List of tests (`index`, `manual`, `useInStatements`, `description`); also used to count tests |
-| `problem.testInput` | `problemId`, `testset`, `testIndex` | Plain text | `get_all_test_cases` | Input of one test (called once per test) |
-| `problem.testAnswer` | `problemId`, `testset`, `testIndex` | Plain text | `get_all_test_cases` | Expected output of one test (called once per test) |
-| `problem.checker` | `problemId` | JSON | `index()`, `get_custom_checker_info` | Checker name; `std::ncmp.cpp`-style names are normalized, anything not in the list of standard checkers becomes `custom` |
-| `problem.viewFile` | `problemId`, `type` (`source`, then `resource`), `name` | Plain text | `fetch_custom_checker_file` | Source of a custom checker (retries with a `.cpp` suffix) |
-| `problem.updateWorkingCopy` | `problemId` | JSON | `index()` | Refreshes the working copy before reading solutions (only when the problem is already in the DB) |
-| `problem.solutions` | `problemId` | JSON | `index()` | List solutions; picks the main one (tag `MA`) or the first |
-| `problem.viewSolution` | `problemId`, `name` | Plain text | `index()` | Source code shown in "Main Correct Solution" |
-
-`PolygonAPI` also defines helpers for `problem.statements`, `problem.script`, `problem.files`, and `problem.viewFile` (`get_statements`, `get_test_script`, `get_problem_files`, `get_file_content`), but the current flows do not call them.
-
-**Authentication** (`PolygonAPI._generate_api_sig`)
-
-Credentials are read from Django settings (`POLYGON_API_KEY`, `POLYGON_API_SECRET`, loaded from `.env`) in `PolygonAPI.__init__`. Each request is signed like this:
-
-1. Add `apiKey` and `time` (current Unix time, in seconds) to the request parameters.
-2. Sort all parameters alphabetically by name and URL-encode them into a string (`urlencode`).
-3. Generate a random 6-character prefix `rand` (lowercase letters and digits).
-4. Build the string `rand/<method>?<sorted params>#<API_SECRET>` and take its SHA-512 hex digest.
-5. `apiSig = rand + digest`.
-6. Send the original parameters plus `apiKey`, `time`, and `apiSig` in the POST body.
-
-The secret is only used to compute the hash; it is never sent over the wire. A new `time` and `rand` are generated for every call, so each signature is unique.
-
-**Error handling:** an HTTP error raises `HTTP Request Error: ...`. For JSON replies, a body with `status == "FAILED"` raises `Polygon API Error: <comment>`, otherwise `result` is returned. A package download that does not start with the ZIP signature (`PK`) is treated as an error. Failures in the fetch/migrate flows reach the user as the red error box and trigger the rollback described in section 8.
-
-**Performance note:** `get_all_test_cases` makes `1 + 2 * N` Polygon calls for N tests, which is why results are cached in Redis for 30 minutes and reused by the migration steps.
-
-### 7.2 Cloud storage (Supabase Storage via the S3-compatible API)
-
-**Provider and access** (`problems/storage.py`, `problems/S3Testcase.py::S3StorageManager`): `STORAGE_PROVIDER=s3` makes `get_storage()` return `S3StorageManager`, a boto3 S3 client pointed at the Supabase S3 endpoint (`S3_ENDPOINT_URL`, region `AWS_REGION`). It authenticates with the S3 access key pair from `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`); missing credentials raise a `ValueError`. The bucket name comes from `AWS_S3_BUCKET_NAME` (`get_container_name()`). The code depends only on a small interface (`upload_test_case`, `upload_file`, `empty_blob`), so Azure (`AzureTestcase.py`) can be swapped in with `STORAGE_PROVIDER=azure`; it is not used here.
-
-**File naming and organization**
-
-All files for one problem live under one prefix, named with the **database problem ID** (`Problem.id`), not the Polygon ID:
-
-```
-<bucket>/
-  test_cases/
-    <db_problem_id>/
-      01            <- input of test 1
-      01.a          <- expected output (answer) of test 1
-      02
-      02.a
-      ...
-      custom_checker       <- compiled checker binary (built with g++ on the Linux server)
-      custom_checker.cpp   <- checker source, uploaded only if compilation fails
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant V as users.views.login_view
+    participant A as EmailBackend
+    participant DB as PostgreSQL
+    B->>V: POST /users/login/ (email, password, csrf)
+    V->>A: authenticate(username=email, email=email, password)
+    A->>DB: SELECT user WHERE email = ...
+    DB-->>A: user row
+    A-->>V: user (password and is_active OK)
+    V->>DB: INSERT django_session, UPDATE last_login
+    V-->>B: 302 to / (Set-Cookie: sessionid)
+    B->>V: GET / (with sessionid)
 ```
 
-Rules:
+#### Things to know
 
-- Test number = the test's position in the list from Polygon, starting at 1, zero-padded to two digits (`01`, `02`, ... `12`). The output file adds the `.a` suffix.
-- Only tests with both a non-empty input and a non-empty output are uploaded. Skipped tests leave a gap in the numbering, because the number is the position in the list.
-- The custom checker is uploaded only for problems whose checker is not a standard one. It is compiled with `g++ -std=gnu++17 -O2` and the binary is uploaded; if compilation fails, the `.cpp` source is uploaded instead.
-- Re-running the migration is safe: `empty_blob(bucket, db_id)` first deletes every object under `test_cases/<db_id>/` (the trailing slash in the prefix keeps `test_cases/7/` from matching `test_cases/70/`), and then the files are uploaded again.
-- File contents are the raw text from Polygon, uploaded as bytes (`put_object`).
-
----
-
-## 8. Error handling and rollback (applies to flows 3 to 5)
-
-- Each POST runs inside `transaction.atomic()`, so any exception rolls back all database changes from that request.
-- Cloud storage is not transactional. If the upload itself fails, `delete_problem_files(db_id)` removes partial uploads. If a later step in the same request fails, the outer `except` removes the files uploaded earlier (`storage_uploaded` and `storage_problem_id`).
-- The outer `except` also calls `clear_test_cases_from_redis(polygon_id)` so a bad cache is not reused.
-- The user sees: "Migration failed and all changes have been rolled back. Reason: ...".
-
-## 9. Running the tests
-
-```
-python manage.py test problems
-```
-
-`problems/tests.py` covers the S3 file layout and zero-padding, prefix-safe deletion, provider selection from settings, and the migration flow (skips incomplete test cases, clears old files first, `delete_problem_files` never raises).
+- **The `next` parameter is ignored.** The decorator adds `?next=/` to the login URL, but `login_view` never reads it. After login the user always goes to `problems:index`.
+- **Only staff can use the app.** A normal user with a correct password is still rejected. Staff status is set with `is_staff` in the admin, and `UserManager.create_superuser` sets it automatically.
+- **Creating a user needs more than an email and password.** `REQUIRED_FIELDS` in `users/models.py` is `first_name`, `last_name`, `username`, `contact_number`, `college`, `graduation_year`, `gender`. This is why `python manage.py createsuperuser` asks for them.
+- **The Django admin (`/admin/`) has its own login page.** It uses the same users, but it is not this flow.
